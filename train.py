@@ -4,16 +4,43 @@
 
 import os
 import warnings
-import sys
+import uuid
+from pathlib import Path
+
+# The system temporary directory is not writable in this environment. Configure
+# it before importing MLflow, which creates temporary model artifacts.
+PROJECT_DIR = Path(__file__).resolve().parent
+TEMP_DIR = PROJECT_DIR / ".tmp"
+TEMP_DIR.mkdir(exist_ok=True)
+os.environ["TEMP"] = str(TEMP_DIR)
+os.environ["TMP"] = str(TEMP_DIR)
 
 import pandas as pd
 import numpy as np
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.model_selection import train_test_split
-from sklearn.linear_model import ElasticNet
+from sklearn.ensemble import RandomForestRegressor
 
 import mlflow
 import mlflow.sklearn
+from mlflow.utils import file_utils as mlflow_file_utils
+
+
+def create_writable_temp_dir():
+    """Create a MLflow scratch directory without Windows' restricted 0o700 ACL."""
+    while True:
+        path = TEMP_DIR / f"mlflow-{uuid.uuid4().hex}"
+        try:
+            path.mkdir(mode=0o777)
+            return str(path)
+        except FileExistsError:
+            continue
+
+
+# Python 3.14 creates tempfile directories with a restrictive Windows ACL in
+# this environment. MLflow normally uses tempfile.mkdtemp(), so replace only
+# its factory with a writable, project-local equivalent.
+mlflow_file_utils.create_tmp_dir = create_writable_temp_dir
 
 
 def eval_metrics(actual, pred):
@@ -28,8 +55,16 @@ if __name__ == "__main__":
     warnings.filterwarnings("ignore")
     np.random.seed(40)
 
+    # Keep experiment data writable and independent of the current shell.
+    # A user-supplied MLFLOW_TRACKING_URI still takes precedence.
+    mlflow.set_tracking_uri(
+        os.environ.get(
+            "MLFLOW_TRACKING_URI", f"sqlite:///{(PROJECT_DIR / 'mlflow.db').as_posix()}"
+        )
+    )
+
     # Read the wine-quality csv file (make sure you're running this from the root of MLflow!)
-    wine_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wine-quality.csv")
+    wine_path = PROJECT_DIR / "wine-quality.csv"
     data = pd.read_csv(wine_path)
 
     # Split the data into training and test sets. (0.75, 0.25) split.
@@ -38,29 +73,26 @@ if __name__ == "__main__":
     # The predicted column is "quality" which is a scalar from [3, 9]
     train_x = train.drop(["quality"], axis=1)
     test_x = test.drop(["quality"], axis=1)
-    train_y = train[["quality"]]
-    test_y = test[["quality"]]
-
-    alpha = float(sys.argv[1]) if len(sys.argv) > 1 else 0.5
-    l1_ratio = float(sys.argv[2]) if len(sys.argv) > 2 else 0.5
+    train_y = train["quality"]
+    test_y = test["quality"]
 
     with mlflow.start_run():
-        lr = ElasticNet(alpha=alpha, l1_ratio=l1_ratio, random_state=42)
+        lr = RandomForestRegressor(n_estimators=200, random_state=42)
         lr.fit(train_x, train_y)
-
         predicted_qualities = lr.predict(test_x)
 
         (rmse, mae, r2) = eval_metrics(test_y, predicted_qualities)
 
-        print("Elasticnet model (alpha=%f, l1_ratio=%f):" % (alpha, l1_ratio))
+        print("Random Forest model (n_estimators=200, random_state=42):")
         print("  RMSE: %s" % rmse)
         print("  MAE: %s" % mae)
         print("  R2: %s" % r2)
 
-        mlflow.log_param("alpha", alpha)
-        mlflow.log_param("l1_ratio", l1_ratio)
+        mlflow.log_param("model_type", "RandomForestRegressor")
+        mlflow.log_param("n_estimators", 200)
+        mlflow.log_param("random_state", 42)
         mlflow.log_metric("rmse", rmse)
         mlflow.log_metric("r2", r2)
         mlflow.log_metric("mae", mae)
 
-        mlflow.sklearn.log_model(lr, "model")
+        mlflow.sklearn.log_model(lr, name="model")
